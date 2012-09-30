@@ -1,0 +1,45 @@
+imapmboxfilter.pl
+=================
+
+(c) 2012 Alex Bligh <alex@alex.org.uk>. See file for licence.
+
+imapmboxfilter is designed to work around a ridiculous limitation
+in Apple Mail. Apple Mail does not support subscriptions for
+mailboxes, so if you sync Apple Mail it either syncs every folder
+or no folders. For some of us with large mailing list archives
+and SSD disks we'd rather not fill with them, or syncing over
+slow connections, this is not desirable behaviour.
+
+So imapmboxfilter sets up a proxy imap server (unencrypted,
+but the connection to the real server from the proxy can be
+encrypted), and allows various mailboxes to be filtered out,
+by a sequence of pcre (perl compatabible regexps) specified
+on the command line. It runs as a daemon which should be launched
+on logon (preferably before Apple Mail).
+
+This sofware was inspired by by imapfilter.pl written by
+Lars Eggert <lars.eggert@gmail.com>, but almost entirely
+rewritten bar the daemonize subroutine.
+
+Usage: $FindBin::Script [options] OMITREGEXP ...
+
+Options:
+  -s, --ssl                   Use SSL for remote server
+  -l, --local ADDR:[PORT]     Use ADDR:PORT to listen on
+  -r, --remote ADDR:[PORT]    Use ADDR:PORT as remote server
+  -t, --timeout SECS          Use SECS as timeout
+  -d, --debug                 Do not fork and print debugging
+  -h, --help                  Print this message
+
+OMITREGEXP is a perl regexp matching a mailbox to omit.
+Put as many as you like on the command line, but remember
+quoting.
+
+Example:
+  imapmboxfilter -r mail.example.com:993 'INBOX\.[omit|archive]\..*'
+will omit all folders beneath 'omit' and 'archive'.
+
+SSL is autodetected if a connection is made to port 993.
+
+This software is beta quality. If it breaks you get to keep both
+halves.
