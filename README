@@ -21,7 +21,7 @@ This sofware was inspired by by imapfilter.pl written by
 Lars Eggert <lars.eggert@gmail.com>, but almost entirely
 rewritten bar the daemonize subroutine.
 
-Usage: $FindBin::Script [options] OMITREGEXP ...
+Usage: imapmboxfilter.pl [options] OMITREGEXP ...
 
 Options:
   -s, --ssl                   Use SSL for remote server
