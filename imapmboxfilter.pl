@@ -146,8 +146,8 @@ sub CloseConnection
     my $muafd = $nummua{$mc};
     my $imapfd = $numimap{$mc};
     printf "$FindBin::Script [%d] closing connection\n", $mc if ($option_debug);
-    $muafd->close();
-    $imapfd->close();
+    $muafd->close() if (defined($muafd));
+    $imapfd->close() if (defined($imapfd));
     delete $datatomua{$mc};
     delete $datatoimap{$mc};
     delete $sessionactive{$mc};
