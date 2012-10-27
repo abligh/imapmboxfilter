@@ -32,14 +32,27 @@ use Net::hostent;
 use POSIX ();
 use Getopt::Long;
 use FindBin;
-use Time::HiRes qw( usleep gettimeofday tv_interval );
+use Time::HiRes qw( sleep usleep gettimeofday tv_interval );
 use Errno qw( EAGAIN EWOULDBLOCK );
 
 my $option_debug = 0;
 my $option_local = "localhost:1143";
 my $option_remote;
 my $option_ssl = 0;
+my $option_kill;
 my $option_timeout = 3600;
+
+my $pidfile;
+my $uid = $<;
+my $un = (getpwuid($<))[0];
+if ($uid)
+{
+    $pidfile = "/tmp/".$FindBin::Script.".$un.pid";
+}
+else
+{
+    $pidfile = "/var/run/".$FindBin::Script.".pid";
+}
 
 my %datatomua;
 my %datatoimap;
@@ -74,6 +87,7 @@ Options:
   -r, --remote ADDR:[PORT]    Use ADDR:PORT as remote server
   -t, --timeout SECS          Use SECS as timeout
   -d, --debug                 Do not fork and print debugging
+  -k, --kill                  Kill existing instance of daemon
   -h, --help                  Print this message
 
 OMITREGEXP is a perl regexp matching a mailbox to omit.
@@ -92,7 +106,8 @@ sub ParseOptions
              "local|l=s" => \$option_local,
              "remote|r=s" => \$option_remote,
 	     "timeout|t=i" => \$option_timeout,
-             "debug|d" => \$option_debug
+             "debug|d" => \$option_debug,
+	     "kill|k" => \$option_kill
         ))
     {
         Syntax();
@@ -138,6 +153,75 @@ sub daemon () {
     open STDERR, "+>&STDOUT";
     STDOUT->autoflush(1);
     STDERR->autoflush(1);
+    $SIG{'INT'} = 'IGNORE';
+    $SIG{'PIPE'} = 'IGNORE';
+    $SIG{'CHLD'} = 'IGNORE';
+    $SIG{'TERM'} = 'IGNORE';
+
+    my $childpid;
+
+    do
+    {
+        $SIG{'TERM'} = 'IGNORE';
+        $childpid = _fork;
+
+        # if we are the child, set signal handlers and return                                                                                                  
+        if (!$childpid)
+        {
+            # wait until the parent has put our PID file in place                                                                                              
+            Timer::HiRes::sleep (0.1) until (-r $pidfile);
+            $SIG{'INT'} = 'IGNORE';
+            $SIG{'PIPE'} = 'IGNORE';
+            $SIG{'CHLD'} = 'IGNORE';
+            $SIG{'TERM'} = sub { kill 9, getppid; unlink($pidfile); exit 0; };
+            return;
+        }
+
+        $SIG{'TERM'} = sub { kill 15, $childpid; };
+        # we are the watcher process                                                                                                                           
+        open (my $pf, ">$pidfile") || die ("Cannot write to pidfile: $!");
+        print $pf "$childpid\n";
+        close $pf;
+
+        # Loop whilst the child exists                                                                                                                         
+        sleep 1 while (kill 0, $childpid);
+    } while (-r $pidfile); # child unlinks PID on clean exit                                                                                                   
+    $SIG{'TERM'} = 'IGNORE';
+    exit 0;
+}
+
+sub KillExisting
+{
+    while ( -r $pidfile )
+    {
+        open (my $pf, "<$pidfile") || die ("Cannot open $pidfile: $!");
+        my $pid = <$pf>;
+        chomp ($pid);
+        close ($pid);
+        unless (($pid=~/^\d+$/) && (kill 0, $pid))
+        {
+            print STDERR "$FindBin::Script removing stale PID file\n";
+            # PID file is stale                                                                                                                                
+            unlink ($pidfile);
+            return;
+        }
+        # up to child to delete pidfile;                                                                                                                       
+        kill 15, $pid;
+        # wait for the existing PID to exit, and also its parent                                                                                               
+        my $i;
+        for ($i=100; $i && (kill 0, $pid); $i--)
+        {
+	    Time::HiRes::sleep (0.1);
+        }
+        return if ($i);
+        print STDERR "$FindBin::Script could not kill old daemon nicely, playing hardball\n";
+        kill 9, $pid unless ($i);
+        for ($i=100; $i && (kill 0, $pid); $i--)
+        {
+	    Time::HiRes::sleep (0.1);
+        }
+        sleep(1);
+    }
 }
 
 sub CloseConnection
@@ -171,6 +255,9 @@ sub MarkActive
 }
 
 ParseOptions;
+
+KillExisting unless $option_debug;
+exit 0 if ($option_kill);
 
 daemon unless $option_debug;
 
