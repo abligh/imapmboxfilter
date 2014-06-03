@@ -35,12 +35,15 @@ use FindBin;
 use Time::HiRes qw( sleep usleep gettimeofday tv_interval );
 use Errno qw( EAGAIN EWOULDBLOCK );
 
+my $maxbuffer = 1024*1024;
+
 my $option_debug = 0;
 my $option_local = "localhost:1143";
 my $option_remote;
 my $option_ssl = 0;
 my $option_kill;
 my $option_timeout = 3600;
+my $option_statfile;
 
 my $pidfile;
 my $uid = $<;
@@ -64,6 +67,7 @@ my %numimap;
 my %muaclose;
 my %imapclose;
 my %stattime;
+my %starttime;
 my %statread;
 my %statwrite;
 
@@ -86,6 +90,7 @@ Options:
   -l, --local ADDR:[PORT]     Use ADDR:PORT to listen on
   -r, --remote ADDR:[PORT]    Use ADDR:PORT as remote server
   -t, --timeout SECS          Use SECS as timeout
+  -f, --statfile FILE         Write stats to FILE
   -d, --debug                 Do not fork and print debugging
   -k, --kill                  Kill existing instance of daemon
   -h, --help                  Print this message
@@ -106,6 +111,7 @@ sub ParseOptions
              "local|l=s" => \$option_local,
              "remote|r=s" => \$option_remote,
 	     "timeout|t=i" => \$option_timeout,
+	     "statfile|f=s" => \$option_statfile,
              "debug|d" => \$option_debug,
 	     "kill|k" => \$option_kill
         ))
@@ -240,10 +246,11 @@ sub CloseConnection
     delete $nummua{$mc};
     delete $numimap{$mc};
     delete $stattime{$mc};
+    delete $starttime{$mc};
     delete $statread{$mc};
     delete $statwrite{$mc};
-    delete $muanum{$muafd};
-    delete $imapnum{$imapfd};
+    delete $muanum{$muafd} if (defined($muafd));
+    delete $imapnum{$imapfd} if (defined($imapfd));
     $imapfd = undef;
     $muafd = undef;
 }
@@ -267,6 +274,8 @@ my $inbound = new IO::Socket::INET(LocalHost => $option_local,
 die "cannot open proxy socket on $option_local - not root?" unless $inbound;
 print "$FindBin::Script [*] listening on $option_local\n" if $option_debug;
 
+my $laststat = [gettimeofday];
+
 while (1)
 {
     my $readable;
@@ -288,15 +297,15 @@ while (1)
 	{
 	    $selectwrite->add($muafd);
 	}
-	if (defined($datatoimap{$mc}) && length($datatoimap{$mc})>0)
+	if (defined($datatoimap{$mc}) && (length($datatoimap{$mc})>0))
 	{
 	    $selectwrite->add($imapfd);
 	}
-	unless (defined($muaclose{$mc}))
+	unless (defined($muaclose{$mc}) || (defined($datatoimap{$mc}) && (length($datatoimap{$mc}) > $maxbuffer)))
 	{
 	    $selectread->add($muafd);
 	}
-	unless (defined($imapclose{$mc}))
+	unless (defined($imapclose{$mc}) || (defined($datatomua{$mc}) && (length($datatomua{$mc}) > $maxbuffer) && (($datatomua{$mc} =~ m/\r\n/m)) ))
 	{
 	    $selectread->add($imapfd);
 	}
@@ -333,6 +342,7 @@ while (1)
 		$datatomua{$mc}="";
 		$datatoimap{$mc}="";
 		$stattime{$mc} = [gettimeofday];
+		$starttime{$mc} = $stattime{$mc};
 		$statread{$mc} = 0;
 		$statwrite{$mc} = 0;
 		delete $sessionactive{$mc};
@@ -471,7 +481,7 @@ while (1)
 		$statwrite{$mc}+=$result;
 		if ($result == length($datatoimap{$mc}))
 		{
-		    $datatoimap{$mc} = undef;
+		    $datatoimap{$mc} = "";
 		}
 		else
 		{
@@ -484,6 +494,11 @@ while (1)
     }
 
     my $now = [gettimeofday];
+    my $statfile;
+    if (defined($option_statfile) && (tv_interval($laststat, $now) > 5))
+    {
+	open ($statfile, ">", $option_statfile.".new") 
+    }
     foreach $mc (keys %sessionactive)
     {
 	if ( (!defined($datatomua{$mc}) || length($datatomua{$mc})==0) &&
@@ -500,12 +515,21 @@ while (1)
 	    next;
 	}
 
+	my $running = tv_interval($starttime{$mc}, $now);
+	$running = 0.001 if ($running < 0.001);
+
+	if (defined($statfile))
+	{
+	    printf $statfile "$FindBin::Script [%d] read=%d write=%d rbuf=%d wbuf=%d rbps=%d wbps=%d\n", $mc, $statread{$mc}, $statwrite{$mc}, length($datatomua{$mc}), length($datatoimap{$mc}), $statread{$mc}/$running, $statwrite{$mc}/$running;
+	}
+
 	my $interval = tv_interval($stattime{$mc}, $now);
 	if (($interval > 5) && $option_debug)
 	{
 	    $stattime{$mc} = $now;
-	    printf "$FindBin::Script [%d] read=%d write=%d\n", $mc, $statread{$mc}, $statwrite{$mc};
+	    printf "$FindBin::Script [%d] read=%d write=%d rbuf=%d wbuf=%d rbps=%d wbps=%d\n", $mc, $statread{$mc}, $statwrite{$mc}, length($datatomua{$mc}), length($datatoimap{$mc}), $statread{$mc}/$running, $statwrite{$mc}/$running;
 	}
+
 	$interval = tv_interval($sessionactive{$mc}, $now);
 	if ($interval > $option_timeout)
 	{
@@ -513,6 +537,13 @@ while (1)
 	    CloseConnection($mc);
 	    next;
 	}
+    }
+
+    if (defined($statfile))
+    {
+	close ($statfile);
+	rename ($option_statfile.".new", $option_statfile);
+	$laststat = $now;
     }
 }
 $inbound->close;
