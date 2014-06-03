@@ -70,6 +70,8 @@ my %stattime;
 my %starttime;
 my %statread;
 my %statwrite;
+my %laststatread;
+my %laststatwrite;
 
 my $connection = 0;
 
@@ -249,6 +251,8 @@ sub CloseConnection
     delete $starttime{$mc};
     delete $statread{$mc};
     delete $statwrite{$mc};
+    delete $laststatread{$mc};
+    delete $laststatwrite{$mc};
     delete $muanum{$muafd} if (defined($muafd));
     delete $imapnum{$imapfd} if (defined($imapfd));
     $imapfd = undef;
@@ -345,6 +349,8 @@ while (1)
 		$starttime{$mc} = $stattime{$mc};
 		$statread{$mc} = 0;
 		$statwrite{$mc} = 0;
+		$laststatread{$mc} = 0;
+		$laststatwrite{$mc} = 0;
 		delete $sessionactive{$mc};
 		delete $muaclose{$mc};
 		delete $imapclose{$mc};
@@ -518,9 +524,14 @@ while (1)
 	my $running = tv_interval($starttime{$mc}, $now);
 	$running = 0.001 if ($running < 0.001);
 
+	my $statinterval = tv_interval($laststat, $now);
+	$statinterval = 0.001 if ($statinterval < 0.001);
+
 	if (defined($statfile))
 	{
-	    printf $statfile "$FindBin::Script [%d] read=%d write=%d rbuf=%d wbuf=%d rbps=%d wbps=%d\n", $mc, $statread{$mc}, $statwrite{$mc}, length($datatomua{$mc}), length($datatoimap{$mc}), $statread{$mc}/$running, $statwrite{$mc}/$running;
+	    printf $statfile "$FindBin::Script [%d] read=%d write=%d rbuf=%d wbuf=%d rbps=%d wbps=%d ival=%d\n", $mc, $statread{$mc}, $statwrite{$mc}, length($datatomua{$mc}), length($datatoimap{$mc}), ($statread{$mc}-$laststatread{$mc})/$statinterval, ($statwrite{$mc}-$laststatwrite{$mc})/$statinterval, $statinterval;
+	    $laststatread{$mc} = $statread{$mc};
+	    $laststatwrite{$mc} = $statwrite{$mc};
 	}
 
 	my $interval = tv_interval($stattime{$mc}, $now);
