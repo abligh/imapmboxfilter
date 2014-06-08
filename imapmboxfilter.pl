@@ -30,14 +30,16 @@ use IO::Select;
 use IO::Socket::INET;
 use Net::hostent;
 use POSIX ();
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case bundling);
 use FindBin;
 use Time::HiRes qw( sleep usleep gettimeofday tv_interval );
 use Errno qw( EAGAIN EWOULDBLOCK );
 
 my $maxbuffer = 1024*1024;
+my $maxreadsize = 32*1024;
 
 my $option_debug = 0;
+my $option_nofork = 0;
 my $option_local = "localhost:1143";
 my $option_remote;
 my $option_ssl = 0;
@@ -72,6 +74,10 @@ my %statread;
 my %statwrite;
 my %laststatread;
 my %laststatwrite;
+my %read_waiton_read_ssl;
+my %read_waiton_write_ssl;
+my %write_waiton_read_ssl;
+my %write_waiton_write_ssl;
 
 my $connection = 0;
 
@@ -93,7 +99,8 @@ Options:
   -r, --remote ADDR:[PORT]    Use ADDR:PORT as remote server
   -t, --timeout SECS          Use SECS as timeout
   -f, --statfile FILE         Write stats to FILE
-  -d, --debug                 Do not fork and print debugging
+  -d, --debug                 Print debugging
+  -n, --nofork                Do not fork
   -k, --kill                  Kill existing instance of daemon
   -h, --help                  Print this message
 
@@ -114,7 +121,8 @@ sub ParseOptions
              "remote|r=s" => \$option_remote,
 	     "timeout|t=i" => \$option_timeout,
 	     "statfile|f=s" => \$option_statfile,
-             "debug|d" => \$option_debug,
+             "debug|d" => \$option_debug++,
+	     "nofork|n" => \$option_nofork,
 	     "kill|k" => \$option_kill
         ))
     {
@@ -156,7 +164,7 @@ sub daemon () {
     foreach my $i (0..POSIX::sysconf(&POSIX::_SC_OPEN_MAX)) { POSIX::close $i; }
 
     # Reopen stderr, stdout, stdin to /dev/null
-    open STDIN,  "+>/dev/null";
+    open STDIN,  "/dev/null";
     open STDOUT, "| /usr/bin/logger -p user.notice";
     open STDERR, "+>&STDOUT";
     STDOUT->autoflush(1);
@@ -177,7 +185,7 @@ sub daemon () {
         if (!$childpid)
         {
             # wait until the parent has put our PID file in place                                                                                              
-            Timer::HiRes::sleep (0.1) until (-r $pidfile);
+            Time::HiRes::sleep (0.1) until (-r $pidfile);
             $SIG{'INT'} = 'IGNORE';
             $SIG{'PIPE'} = 'IGNORE';
             $SIG{'CHLD'} = 'IGNORE';
@@ -253,6 +261,10 @@ sub CloseConnection
     delete $statwrite{$mc};
     delete $laststatread{$mc};
     delete $laststatwrite{$mc};
+    delete $read_waiton_read_ssl{$mc};
+    delete $read_waiton_write_ssl{$mc};
+    delete $write_waiton_read_ssl{$mc};
+    delete $write_waiton_write_ssl{$mc};
     delete $muanum{$muafd} if (defined($muafd));
     delete $imapnum{$imapfd} if (defined($imapfd));
     $imapfd = undef;
@@ -267,10 +279,10 @@ sub MarkActive
 
 ParseOptions;
 
-KillExisting unless $option_debug;
+KillExisting unless $option_nofork;
 exit 0 if ($option_kill);
 
-daemon unless $option_debug;
+daemon unless $option_nofork;
 
 my $inbound = new IO::Socket::INET(LocalHost => $option_local,
                                    Listen => 50,
@@ -282,6 +294,7 @@ my $laststat = [gettimeofday];
 
 while (1)
 {
+    my %pending_read;
     my $readable;
     my $writeable;
     my $exceptions;
@@ -290,6 +303,7 @@ while (1)
     
     my $selectread = IO::Select->new($inbound);
     my $selectwrite = IO::Select->new();
+    my $selecttimeout = 1;
     foreach $mc (keys %sessionactive)
     {
 	my $muafd = $nummua{$mc};
@@ -303,7 +317,11 @@ while (1)
 	}
 	if (defined($datatoimap{$mc}) && (length($datatoimap{$mc})>0))
 	{
-	    $selectwrite->add($imapfd);
+	    unless ($read_waiton_read_ssl{$mc} || $read_waiton_write_ssl{$mc})
+	    {
+		$selectwrite->add($imapfd);
+		$selectread->add($imapfd) if ($write_waiton_read_ssl{$mc});
+	    }
 	}
 	unless (defined($muaclose{$mc}) || (defined($datatoimap{$mc}) && (length($datatoimap{$mc}) > $maxbuffer)))
 	{
@@ -311,192 +329,268 @@ while (1)
 	}
 	unless (defined($imapclose{$mc}) || (defined($datatomua{$mc}) && (length($datatomua{$mc}) > $maxbuffer) && (($datatomua{$mc} =~ m/\r\n/m)) ))
 	{
-	    $selectread->add($imapfd);
+	    unless ($write_waiton_read_ssl{$mc} || $write_waiton_write_ssl{$mc})
+	    {
+		$selectread->add($imapfd);
+		$selectwrite->add($imapfd) = 1 if ($read_waiton_write_ssl{$mc});
+		if ($option_ssl)
+		{
+		    $pending_read{$mc} = 1 if ($imapfd->pending());
+		}
+	    }
 	}
     }
 
-    ($readable, $writeable) = IO::Select->select ($selectread, $selectwrite, undef, 1);
+    if (%pending_read)
+    {
+	$selecttimeout = 0.01;
+	printf "$FindBin::Script using zero select timeout\n",$mc if $option_debug;
+    }
+    
+    ($readable, $writeable) = IO::Select->select ($selectread, $selectwrite, undef, $selecttimeout);
+    
+    # make pending fds appear to be ready
+    foreach $fd (@$readable)
+    {
+	my $mc = $imapnum{$fd};
+	next unless(defined($mc));
+	delete $pending_read{$mc};
+    }
+    foreach $mc (keys %pending_read)
+    {
+	push @$readable, $numimap{$mc};
+    }
+
+    my %ireadable;
+    my %iwriteable;
+    my %mreadable;
+    my %mwriteable;
+    my $newconnection;
 
     foreach $fd (@$readable)
     {
-        if ($fd == $inbound)
+	next unless ($fd);
+	if (defined($mc = $imapnum{$fd}))
 	{
-	    # a MUA is opening a new connection to us, open relay to server
-
-            my $muafd = $inbound->accept;
-	    $mc = $connection++;
-            printf "$FindBin::Script [%d] connected to MUA\n",$mc if $option_debug;
-
-            my $imapfd = $option_ssl?(new IO::Socket::SSL($option_remote)):(new IO::Socket::INET($option_remote));
-	    
-            unless (defined $imapfd)
-	    {
-                $muafd->close;
-                printf "$FindBin::Script [%d] cannot connect to $option_remote: $!\n", $mc if $option_debug;
-            }
-	    else
-	    {
-		$muafd->blocking(0);
-		$imapfd->blocking(0);
-		$nummua{$mc} = $muafd;
-		$numimap{$mc} = $imapfd;
-		$mc = $mc;
-		$muanum{$muafd}= $mc;
-		$imapnum{$imapfd}= $mc;
-		$datatomua{$mc}="";
-		$datatoimap{$mc}="";
-		$stattime{$mc} = [gettimeofday];
-		$starttime{$mc} = $stattime{$mc};
-		$statread{$mc} = 0;
-		$statwrite{$mc} = 0;
-		$laststatread{$mc} = 0;
-		$laststatwrite{$mc} = 0;
-		delete $sessionactive{$mc};
-		delete $muaclose{$mc};
-		delete $imapclose{$mc};
-		MarkActive($mc);
-                printf "$FindBin::Script [%d] connected to $option_remote using %s\n", $mc, $option_ssl?"ssl":"raw" if $option_debug;
-            }
-        }
-        elsif ($fd and exists $muanum{$fd})
-	{
-	    # the MUA is sending something to the IMAP server, read the data
-	    my $mc = $muanum{$fd};
-	    my $muafd = $nummua{$mc};
-	    my $imapfd = $numimap{$mc};
-	    my $data;
-	    my $result = sysread $muafd, $data, 8192;
-	    if (!defined($result))
-	    {
-		if (($! != EAGAIN) && ($! != EWOULDBLOCK))
-		{
-		    printf "$FindBin::Script [%d] mua sysread $!\n", $mc if $option_debug;
-		    CloseConnection($fd);
-		}
-	    }
-	    elsif ($result == 0)
-	    {
-		$muaclose{$mc} = 1;
-	    }
-	    else
-	    {
-		$datatoimap{$mc}.=$data;
-		MarkActive($mc);
-	    }
+	    $ireadable{$mc}++ unless ($write_waiton_read_ssl{$mc} || $write_waiton_write_ssl{$mc});
+	    $iwriteable{$mc}++ if ($write_waiton_read_ssl{$mc} && !($read_waiton_read_ssl{$mc} || $read_waiton_write_ssl{$mc}));
 	}
-        elsif ($fd and exists $imapnum{$fd})
+	$mreadable{$mc}++ if (defined ($mc = $muanum {$fd}));
+	$newconnection = 1 if ($fd == $inbound);
+    }
+    foreach $fd (@$writeable)
+    {
+	next unless ($fd);
+	if (defined($mc = $imapnum{$fd}))
 	{
-	    # the IMAP server is sending something to the MUA, read the data
-	    my $mc = $imapnum{$fd};
-	    my $muafd = $nummua{$mc};
-	    my $imapfd = $numimap{$mc};
-	    my $data;
-	    my $result = sysread $imapfd, $data, 8192;
-	    if (!defined($result))
-	    {
-		if (($! != EAGAIN) && ($! != EWOULDBLOCK))
-		{
-		    printf "$FindBin::Script [%d] imap sysread $!\n", $mc if $option_debug;
-		    CloseConnection($fd);
-		}
-	    }
-	    elsif ($result == 0)
-	    {
-		$imapclose{$mc} = 1;
-	    }
-	    else
-	    {
-		$datatomua{$mc}.=$data;
-		MarkActive($mc);
-	    }
+	    $iwriteable{$mc}++ unless ($read_waiton_read_ssl{$mc} || $read_waiton_write_ssl{$mc});
+	    $ireadable{$mc}++ if ($read_waiton_write_ssl{$mc} && !($write_waiton_read_ssl{$mc} || $write_waiton_write_ssl{$mc}));
+	}
+	$mwriteable{$mc}++ if (defined ($mc = $muanum {$fd}));
+    }
+	
+    if ($newconnection)
+    {
+	# a MUA is opening a new connection to us, open relay to server
+	
+	my $muafd = $inbound->accept;
+	$mc = $connection++;
+	printf "$FindBin::Script [%d] connected to MUA\n",$mc if $option_debug;
+	
+	my $imapfd = $option_ssl?(new IO::Socket::SSL($option_remote)):(new IO::Socket::INET($option_remote));
+	
+	unless (defined $imapfd)
+	{
+	    $muafd->close;
+	    printf "$FindBin::Script [%d] cannot connect to $option_remote: $!\n", $mc if $option_debug;
+	}
+	else
+	{
+	    $muafd->blocking(0);
+	    $imapfd->blocking(0);
+	    $nummua{$mc} = $muafd;
+	    $numimap{$mc} = $imapfd;
+	    $mc = $mc;
+	    $muanum{$muafd}= $mc;
+	    $imapnum{$imapfd}= $mc;
+	    $datatomua{$mc}="";
+	    $datatoimap{$mc}="";
+	    $stattime{$mc} = [gettimeofday];
+	    $starttime{$mc} = $stattime{$mc};
+	    $statread{$mc} = 0;
+	    $statwrite{$mc} = 0;
+	    $laststatread{$mc} = 0;
+	    $laststatwrite{$mc} = 0;
+	    $read_waiton_read_ssl{$mc} = 0;
+	    $read_waiton_write_ssl{$mc} = 0;
+	    $write_waiton_read_ssl{$mc} = 0;
+	    $write_waiton_write_ssl{$mc} = 0;
+	    delete $sessionactive{$mc};
+	    delete $muaclose{$mc};
+	    delete $imapclose{$mc};
+	    MarkActive($mc);
+	    printf "$FindBin::Script [%d] connected to $option_remote using %s\n", $mc, $option_ssl?"ssl":"raw" if $option_debug;
 	}
     }
 
-    foreach $fd (@$writeable)
+    foreach $mc (keys %mreadable)
     {
-	if ($fd and exists $muanum{$fd})
+	# the MUA is sending something to the IMAP server, read the data
+	my $muafd = $nummua{$mc};
+	my $imapfd = $numimap{$mc};
+	my $data;
+	my $result = sysread $muafd, $data, $maxreadsize;
+	if (!defined($result))
 	{
-	    # the MUA connection is writeable
-	    my $mc = $muanum{$fd};
-	    my $muafd = $nummua{$mc};
-	    my $imapfd = $numimap{$mc};
-
-	    if ($datatomua{$mc} !~ /\r\n/)
+	    if (($! != EAGAIN) && ($! != EWOULDBLOCK))
 	    {
-		printf "$FindBin::Script [%d] Internal logic error - no break\n", $mc if $option_debug;
-		next;
+		printf "$FindBin::Script [%d] mua sysread $!\n", $mc if $option_debug;
+		CloseConnection($mc);
 	    }
+	}
+	elsif ($result == 0)
+	{
+	    $muaclose{$mc} = 1;
+	}
+	else
+	{
+	    $datatoimap{$mc}.=$data;
+	    MarkActive($mc);
+	}
+    }
 
-	    # Replace data to write by the bit (if anything) after the final \r\n
-	    my $d1=$datatomua{$mc};
-	    $datatomua{$mc} =~ s/^(.*\r\n)(.*)$/$2/s;
-	    my $d2=$datatomua{$mc};
-	    my $towrite=$1;
-
-	    if (!defined($towrite) || ($towrite eq ""))
+    foreach $mc (keys %ireadable)
+    {
+	# the IMAP server is sending something to the MUA, read the data
+	my $muafd = $nummua{$mc};
+	my $imapfd = $numimap{$mc};
+	my $data;
+	$read_waiton_read_ssl{$mc} = 0;
+	$read_waiton_write_ssl{$mc} = 0;
+	my $result = sysread $imapfd, $data, $maxreadsize;
+	if (!defined($result))
+	{
+	    if (($! == EAGAIN) && $option_ssl)
 	    {
-		printf "$FindBin::Script [%d] Internal logic error - could not get write string\nD1=<<<%s>>>\nD2=<<<%s>>>\nTW=<<<%s>>>", $mc, $d1, $d2, defined($towrite)?$towrite:'undef' if $option_debug;
-		next;
-	    }
-
-	    foreach my $pattern (@omit)
-	    {
-		$towrite =~
-		    s/^\* LIST (\([^)]*\))? "[^"]" "?$pattern[^\r\n]*"?\r\n//gm;
-	    }
-	    
-	    my $result = syswrite $muafd, $towrite;
-	    if (!defined($result))
-	    {
-		# restore unwritten data to write
-		$datatomua{$mc} = $towrite.$datatomua{$mc};
-		if (($! != EAGAIN) && ($! != EWOULDBLOCK))
-		{
-		    printf "$FindBin::Script [%d] mua syswrite $!\n", $mc if $option_debug;
-		    CloseConnection($fd);
+		if ($SSL_ERROR == SSL_WANT_READ) {
+		    printf "$FindBin::Script [%d] imap sysread SSL_WANT_READ\n", $mc if ($option_debug>=2);
+		    $read_waiton_read_ssl{$mc} = 1;
 		}
+		elsif ($SSL_ERROR == SSL_WANT_WRITE) {
+		    printf "$FindBin::Script [%d] imap sysread SSL_WANT_WRITE\n", $mc if ($option_debug>=2);
+		    $read_waiton_write_ssl{$mc} = 1;
+		}
+	    }
+	    if (($! != EAGAIN) && ($! != EWOULDBLOCK))
+	    {
+		printf "$FindBin::Script [%d] imap sysread $!\n", $mc if $option_debug;
+		CloseConnection($mc);
+	    }
+	}
+	elsif ($result == 0)
+	{
+	    $imapclose{$mc} = 1;
+	}
+	else
+	{
+	    $datatomua{$mc}.=$data;
+	    MarkActive($mc);
+	}
+    }
+
+    foreach $mc (keys %mwriteable)
+    {
+	# the MUA connection is writeable
+	my $muafd = $nummua{$mc};
+	my $imapfd = $numimap{$mc};
+	
+	if ($datatomua{$mc} !~ /\r\n/)
+	{
+	    printf "$FindBin::Script [%d] Internal logic error - no break\n", $mc if $option_debug;
+	    next;
+	}
+	
+	# Replace data to write by the bit (if anything) after the final \r\n
+	my $d1=$datatomua{$mc};
+	$datatomua{$mc} =~ s/^(.*\r\n)(.*)$/$2/s;
+	my $d2=$datatomua{$mc};
+	my $towrite=$1;
+	
+	if (!defined($towrite) || ($towrite eq ""))
+	{
+	    printf "$FindBin::Script [%d] Internal logic error - could not get write string\nD1=<<<%s>>>\nD2=<<<%s>>>\nTW=<<<%s>>>", $mc, $d1, $d2, defined($towrite)?$towrite:'undef' if $option_debug;
+	    next;
+	}
+	
+	foreach my $pattern (@omit)
+	{
+	    $towrite =~
+		s/^\* LIST (\([^)]*\))? "[^"]" "?$pattern[^\r\n]*"?\r\n//gm;
+	}
+	
+	my $result = syswrite $muafd, $towrite;
+	if (!defined($result))
+	{
+	    # restore unwritten data to write
+	    $datatomua{$mc} = $towrite.$datatomua{$mc};
+	    if (($! != EAGAIN) && ($! != EWOULDBLOCK))
+	    {
+		printf "$FindBin::Script [%d] mua syswrite $!\n", $mc if $option_debug;
+		CloseConnection($mc);
+	    }
+	}
+	else
+	{
+	    $statread{$mc}+=$result;
+	    if ($result != length($towrite))
+	    {
+		# restore partially written data
+		$datatomua{$mc} = substr($towrite, $result).$datatomua{$mc};
+	    }
+	    MarkActive($mc);
+	}
+    }
+    
+    foreach $mc (keys %iwriteable)
+    {
+	# the IMAP connection is writeable
+	my $muafd = $nummua{$mc};
+	my $imapfd = $numimap{$mc};
+	$write_waiton_read_ssl{$mc} = 0;
+	$write_waiton_write_ssl{$mc} = 0;
+	my $result = syswrite $imapfd, $datatoimap{$mc};
+	if (!defined($result))
+	{
+	    if (($! == EAGAIN) && $option_ssl)
+	    {
+		if ($SSL_ERROR == SSL_WANT_READ) {
+		    printf "$FindBin::Script [%d] imap syswrite SSL_WANT_READ\n", $mc if ($option_debug>=2);
+		    $write_waiton_read_ssl{$mc} = 1;
+		}
+		elsif ($SSL_ERROR == SSL_WANT_WRITE) {
+		    printf "$FindBin::Script [%d] imap syswrite SSL_WANT_WRITE\n", $mc if ($option_debug>=2);
+		    $write_waiton_write_ssl{$mc} = 1;
+		}
+	    }
+	    if (($! != EAGAIN) && ($! != EWOULDBLOCK))
+	    {
+		printf "$FindBin::Script [%d] imap syswrite $!\n", $mc if $option_debug;
+		CloseConnection($mc);
+	    }
+	}
+	else
+	{
+	    $statwrite{$mc}+=$result;
+	    if ($result == length($datatoimap{$mc}))
+	    {
+		$datatoimap{$mc} = "";
 	    }
 	    else
 	    {
-		$statread{$mc}+=$result;
-		if ($result != length($towrite))
-		{
-		    # restore partially written data
-		    $datatomua{$mc} = substr($towrite, $result).$datatomua{$mc};
-		}
-		MarkActive($mc);
+		$datatoimap{$mc} = substr($datatoimap{$mc}, $result);
 	    }
+	    MarkActive($mc);
 	}
-        elsif ($fd and exists $imapnum{$fd})
-	{
-	    # the IMAP connection is writeable
-	    my $mc = $imapnum{$fd};
-	    my $muafd = $nummua{$mc};
-	    my $imapfd = $numimap{$mc};
-	    my $result = syswrite $imapfd, $datatoimap{$mc};
-	    if (!defined($result))
-	    {
-		if (($! != EAGAIN) && ($! != EWOULDBLOCK))
-		{
-		    printf "$FindBin::Script [%d] imap syswrite $!\n", $mc if $option_debug;
-		    CloseConnection($fd);
-		}
-	    }
-	    else
-	    {
-		$statwrite{$mc}+=$result;
-		if ($result == length($datatoimap{$mc}))
-		{
-		    $datatoimap{$mc} = "";
-		}
-		else
-		{
-		    $datatoimap{$mc} = substr($datatoimap{$mc}, $result);
-		}
-		MarkActive($mc);
-	    }
-	}
-
     }
 
     my $now = [gettimeofday];
@@ -512,7 +606,7 @@ while (1)
 	     (defined($muaclose{$mc}) || defined($imapclose{$mc}))
 	     )
 	{
-            printf "$FindBin::Script [%d] closing connection MUA=%d, IMAP=%d\n",
+            printf "$FindBin::Script [%d] closing connection by request MUA=%d, IMAP=%d\n",
 	    $mc,
 	    defined($muaclose{$mc})?1:0,
 	    defined($imapclose{$mc})?1:0
@@ -535,7 +629,7 @@ while (1)
 	}
 
 	my $interval = tv_interval($stattime{$mc}, $now);
-	if (($interval > 5) && $option_debug)
+	if (($interval > 5) && ($option_debug>=2))
 	{
 	    $stattime{$mc} = $now;
 	    printf "$FindBin::Script [%d] read=%d write=%d rbuf=%d wbuf=%d rbps=%d wbps=%d\n", $mc, $statread{$mc}, $statwrite{$mc}, length($datatomua{$mc}), length($datatoimap{$mc}), $statread{$mc}/$running, $statwrite{$mc}/$running;
