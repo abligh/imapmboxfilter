@@ -213,7 +213,7 @@ sub KillExisting
         open (my $pf, "<$pidfile") || die ("Cannot open $pidfile: $!");
         my $pid = <$pf>;
         chomp ($pid);
-        close ($pid);
+        close ($pf);
         unless (($pid=~/^\d+$/) && (kill 0, $pid))
         {
             print STDERR "$FindBin::Script removing stale PID file\n";
