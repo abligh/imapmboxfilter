@@ -1,6 +1,9 @@
 imapmboxfilter.pl
 =================
 
+Note - superseded by goimapfilter - see
+  https://github.com/abligh/goimapfilter
+
 (c) 2012 Alex Bligh <alex@alex.org.uk>. See file for licence.
 
 imapmboxfilter is designed to work around a ridiculous limitation
